@@ -6,6 +6,8 @@ bl_info = {
     "description": "Load a dual-arm trajectory (t + 7 pos + 7 vel per arm) and scrub with a slider",
 }
 
+# from matplotlib.pyplot import box
+# from matplotlib.style import context
 import bpy, os, math, bisect
 from bpy.types import Panel, Operator
 from bpy.props import StringProperty, BoolProperty, IntProperty, FloatProperty, EnumProperty
@@ -18,6 +20,58 @@ TRAJ_B = None     # same for Arm B
 ARMREFS = {'A': None, 'B': None}   # caches (obj,bone) lists per arm
 
 # -------- Utilities --------
+# -------- TCP link (A<->B) utilities (ADD) --------
+def _ensure_material(mat_name):
+    """Make a simple grey material if it doesn't exist."""
+    mat = bpy.data.materials.get(mat_name)
+    if mat:
+        return mat
+    mat = bpy.data.materials.new(mat_name)
+    mat.use_nodes = True
+    # Keep default Principled BSDF, just set Base Color
+    bsdf = mat.node_tree.nodes.get("Principled BSDF")
+    if bsdf:
+        bsdf.inputs["Base Color"].default_value = (0.5, 0.5, 0.5, 1.0)
+        bsdf.inputs["Roughness"].default_value = 0.6
+    return mat
+
+def _make_tcp_link_curve(points_a, points_b,
+                         coll_name="TCP A<->B Links",
+                         obj_name="TCP_AB_Links",
+                         material_name="trajectoryGray",
+                         radius=0.002):
+    coll = _ensure_collection(coll_name)
+
+    n = min(len(points_a), len(points_b))
+    if n == 0:
+        raise RuntimeError("No points to link.")
+
+    curve = bpy.data.curves.new(obj_name + "_Curve", type='CURVE')
+    curve.dimensions = '3D'
+    curve.bevel_depth = radius
+    curve.bevel_resolution = 4
+
+    for i in range(n):
+        spline = curve.splines.new('POLY')
+        spline.points.add(1)
+        spline.points[0].co = (*points_a[i], 1.0)
+        spline.points[1].co = (*points_b[i], 1.0)
+
+    obj = bpy.data.objects.new(obj_name, curve)
+    coll.objects.link(obj)
+
+    mat = _ensure_material(material_name)
+    obj.data.materials.append(mat)
+
+    return n, obj
+
+def _clear_tcp_links():
+    prefixes = ("TCP Links (", "TCP Endpoints EXT (")
+    to_delete = [c for c in bpy.data.collections if c.name.startswith(prefixes)]
+    for coll in to_delete:
+        _delete_collection_and_contents(coll)
+    return len(to_delete)
+
 def get_joint_bone(base_name, index, suffix, bone_name):
     obj_name = f"{base_name}{index}{suffix}"
     obj = bpy.data.objects.get(obj_name)
@@ -152,18 +206,30 @@ def _ensure_collection(name):
     _make_collection_renderable(coll)   # <-- ADD THIS LINE
     return coll
 
-def _ensure_tcp_marker(name="TCP_Marker_Template"):
+def _ensure_tcp_marker(name, material_name):
+    """
+    Create (or reuse) a TCP marker template UNIQUE per material.
+    """
     obj = bpy.data.objects.get(name)
     if obj and obj.type == 'MESH':
         return obj
-    # Make a tiny low-res UV sphere as a template
+
     mesh = bpy.data.meshes.new(name + "_Mesh")
     bm = bmesh.new()
     bmesh.ops.create_uvsphere(bm, u_segments=12, v_segments=8, radius=1.0)
-    bm.to_mesh(mesh); bm.free()
+    bm.to_mesh(mesh)
+    bm.free()
+
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.scene.collection.objects.link(obj)
-    obj.hide_set(True); obj.hide_render = True
+
+    # Assign material ONCE
+    mat = bpy.data.materials.get(material_name)
+    if mat:
+        mesh.materials.append(mat)
+
+    obj.hide_set(True)
+    obj.hide_render = True
     obj.display_type = 'WIRE'
     return obj
 
@@ -204,10 +270,11 @@ def _parse_tcp_positions(filepath, delim_mode="AUTO", has_header=False, column_m
     return pts
 
 def _scatter_tcp_points(points, radius=0.01, coll_name="TCP Points", material_name=None):
-    template = _ensure_tcp_marker()
+    template_name = f"TCP_Marker_Template_{material_name}"
+    template = _ensure_tcp_marker(template_name, material_name)
     coll = _ensure_collection(coll_name)
-    if material_name:
-        _assign_material_to_template(template, material_name)  # <-- add this line
+    # if material_name:
+    #     _assign_material_to_template(template, material_name)  # <-- add this line
 
     for i, (x, y, z) in enumerate(points):
         inst = template.copy()
@@ -227,6 +294,31 @@ def _scatter_tcp_points(points, radius=0.01, coll_name="TCP Points", material_na
     except:
         pass
     return len(points)
+
+def _extend_endpoints(points_a, points_b, extend_len=0.01):
+    """
+    For each pair (A[i], B[i]), create Aext = A + unit(A-B)*extend_len.
+    Returns: (points_b, points_aext)
+    """
+    n = min(len(points_a), len(points_b))
+    b_out = []
+    aext_out = []
+
+    for i in range(n):
+        A = Vector(points_a[i])
+        B = Vector(points_b[i])
+        d = A - B
+        if d.length < 1e-12:
+            # Degenerate: A==B, just push in +X a bit to avoid zero dir
+            u = Vector((1.0, 0.0, 0.0))
+        else:
+            u = d.normalized()
+
+        Aext = A + u * extend_len
+        b_out.append((B.x, B.y, B.z))
+        aext_out.append((Aext.x, Aext.y, Aext.z))
+
+    return b_out, aext_out
 
 # -------- TCP clear utilities (ADD) --------
 def _delete_collection_and_contents(coll):
@@ -295,6 +387,79 @@ def _make_collection_renderable(coll):
             lc.indirect_only = False
         except Exception:
             pass
+
+def _iter_collections_by_prefix(prefixes):
+    for c in bpy.data.collections:
+        if c.name.startswith(prefixes):
+            yield c
+
+def _apply_scrub_to_collection_objects(coll, factor, index_key="tcp_i"):
+    """Hide objects whose custom index >= show_n."""
+    indexed = [o for o in coll.objects if index_key in o]
+    if not indexed:
+        return
+
+    max_i = max(int(o[index_key]) for o in indexed)
+    total = max_i + 1
+
+    factor = max(0.0, min(1.0, float(factor)))
+    show_n = int(factor * total + 1e-9)  # 0->none, 1->all
+
+    for o in indexed:
+        i = int(o[index_key])
+        hide = (i >= show_n)
+        o.hide_set(hide)
+        o.hide_render = hide
+
+def apply_tcp_scrub(context):
+    scn = context.scene
+    f = scn.tcp_scrub
+
+    # Points collections (A, B, EXT endpoints)
+    for coll in _iter_collections_by_prefix(("TCP A (", "TCP B (", "TCP Endpoints EXT (")):
+        _apply_scrub_to_collection_objects(coll, f, index_key="tcp_i")
+
+    # Links collections (A<->B link segments)
+    for coll in _iter_collections_by_prefix(("TCP Links (",)):
+        _apply_scrub_to_collection_objects(coll, f, index_key="tcp_i")
+
+def _on_tcp_scrub_update(self, context):
+    try:
+        apply_tcp_scrub(context)
+    except Exception as e:
+        print("[TCP] Scrub error:", e)
+
+def _make_tcp_link_segment_objects(points_a, points_b,
+                                  coll_name="TCP A<->B Links",
+                                  obj_prefix="TCP_AB_LinkSeg",
+                                  material_name="trajectoryGray",
+                                  radius=0.002):
+    coll = _ensure_collection(coll_name)
+
+    n = min(len(points_a), len(points_b))
+    if n == 0:
+        raise RuntimeError("No points to link.")
+
+    mat = _ensure_material(material_name)
+
+    for i in range(n):
+        curve = bpy.data.curves.new(f"{obj_prefix}_{i:04d}_Curve", type='CURVE')
+        curve.dimensions = '3D'
+        curve.bevel_depth = radius
+        curve.bevel_resolution = 4
+
+        spline = curve.splines.new('POLY')
+        spline.points.add(1)
+        spline.points[0].co = (*points_a[i], 1.0)
+        spline.points[1].co = (*points_b[i], 1.0)
+
+        obj = bpy.data.objects.new(f"{obj_prefix}_{i:04d}", curve)
+        obj["tcp_i"] = i  # <-- important for scrubbing
+        coll.objects.link(obj)
+
+        obj.data.materials.append(mat)
+
+    return n
 
 # -------- Load / Clear operators --------
 class SA_OT_load_a(Operator):
@@ -433,6 +598,101 @@ class SA_OT_tcp_clear_b(Operator):
         n = _clear_tcp_by_prefix("TCP B (")
         self.report({'INFO'}, f"TCP B: cleared {n} collection(s)")
         return {'FINISHED'}
+    
+class SA_OT_tcp_visualize_ab_links(Operator):
+    bl_idname = "sa.tcp_visualize_ab_links"
+    bl_label  = "Visualize TCP A↔B Links"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scn = context.scene
+        fname = scn.da_tcp_filename or ""
+        if not fname:
+            self.report({'ERROR'}, "Set TCP common filename first")
+            return {'CANCELLED'}
+
+        folder_a = scn.sa_folder_a or ""
+        folder_b = scn.sa_folder_b or ""
+        if not folder_a or not folder_b:
+            self.report({'ERROR'}, "Set both Arm A folder and Arm B folder first")
+            return {'CANCELLED'}
+
+        path_a = os.path.join(folder_a, fname)
+        path_b = os.path.join(folder_b, fname)
+
+        try:
+            pts_a = _parse_tcp_positions(
+                path_a,
+                delim_mode=scn.da_delim,
+                has_header=scn.sa_has_header,
+                column_major=scn.tcp_column_major,
+                y_offset=0.281
+            )
+            pts_b = _parse_tcp_positions(
+                path_b,
+                delim_mode=scn.da_delim,
+                has_header=scn.sa_has_header,
+                column_major=scn.tcp_column_major,
+                y_offset=-0.281
+            )
+
+            # ---- Downsample using the same step for BOTH arms (robust) ----
+            step = max(int(scn.tcp_step), 1)
+            n0 = min(len(pts_a), len(pts_b))
+            if n0 == 0:
+                raise RuntimeError("No points to link (A or B is empty).")
+
+            idx = range(0, n0, step)   # <-- indices after step
+            pts_a = [pts_a[i] for i in idx]
+            pts_b = [pts_b[i] for i in idx]
+
+
+            # Create extended endpoints: from B to Aext (past A)
+            pts_b2, pts_aext = _extend_endpoints(pts_a, pts_b, extend_len=scn.tcp_link_extend)
+
+            # n, obj = _make_tcp_link_curve(
+            #     pts_aext, pts_b2,   # NOTE: if your curve function expects (A,B) order, keep consistent
+            #     coll_name=f"TCP Links ({fname})",
+            #     obj_name=f"TCP_AB_Links_{fname}",
+            #     material_name=scn.tcp_link_material,
+            #     radius=0.001
+            # )
+
+            n = _make_tcp_link_segment_objects(
+                    pts_aext, pts_b2,
+                    coll_name=f"TCP Links ({fname})",
+                    obj_prefix=f"TCP_AB_LinkSeg_{fname}",
+                    material_name=scn.tcp_link_material,
+                    radius=0.001
+                )
+
+            
+            _scatter_tcp_points(
+                pts_aext,
+                radius=scn.tcp_radius,
+                coll_name=f"TCP Endpoints EXT ({fname})",
+                material_name=scn.tcp_end_material
+            )
+
+            apply_tcp_scrub(context)
+            apply_tcp_scrub(context)
+
+        except Exception as e:
+            self.report({'ERROR'}, f"TCP Links: {e}")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"TCP Links: Created {n} link segments")
+        return {'FINISHED'}
+class SA_OT_tcp_clear_links(Operator):
+    bl_idname = "sa.tcp_clear_links"
+    bl_label  = "Clear TCP Links"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        n = _clear_tcp_links()
+        self.report({'INFO'}, f"TCP Links: cleared {n} collection(s)")
+        return {'FINISHED'}
+
 
 
 # -------- Panel --------
@@ -517,6 +777,19 @@ class VIEW3D_PT_dual_arm_traj(Panel):
         row.operator("sa.tcp_clear_a", text="Clear TCP A", icon='TRASH')
         row.operator("sa.tcp_clear_b", text="Clear TCP B", icon='TRASH')
 
+        box.prop(scn, "tcp_link_extend", text="Extend beyond A")
+        box.prop(scn, "tcp_end_material", text="End Material")
+
+        box.prop(scn, "tcp_link_material", text="Link Material")
+        row = box.row(align=True)
+        row.operator("sa.tcp_visualize_ab_links", text="Visualize TCP A↔B Links", icon='IPO_LINEAR')
+        row = box.row(align=True)
+        row.operator("sa.tcp_clear_links", text="Clear TCP Links", icon='TRASH')
+        
+        box.separator()
+        box.label(text="TCP Scrub", icon='DRIVER')
+        box.prop(scn, "tcp_scrub", text="Show (0–100%)")
+
 
 # -------- Register --------
 classes = (
@@ -524,6 +797,7 @@ classes = (
     SA_OT_clear_a, SA_OT_clear_b,
     SA_OT_tcp_visualize_a, SA_OT_tcp_visualize_b,
     SA_OT_tcp_clear_a, SA_OT_tcp_clear_b,
+    SA_OT_tcp_visualize_ab_links, SA_OT_tcp_clear_links,
     VIEW3D_PT_dual_arm_traj,
 )
 
@@ -570,6 +844,26 @@ def register():
     bpy.types.Scene.tcp_step          = IntProperty(name="TCP step", default=5, min=1)
     bpy.types.Scene.tcp_column_major  = BoolProperty(name="Column-major 4x4", default=True)
     bpy.types.Scene.tcp_material = StringProperty(name="TCP Material", default="trajectoryBlue")
+    bpy.types.Scene.tcp_link_material = StringProperty(name="TCP Link Material", default="trajectoryBlue")
+
+    bpy.types.Scene.tcp_link_extend = FloatProperty(
+        name="TCP Extend (m)", default=0.01, min=0.0, soft_max=0.2,
+        description="Extend beyond TCP A along the B->A direction"
+    )
+
+    bpy.types.Scene.tcp_end_material = StringProperty(
+        name="Extended TCP Material", default="trajectoryGray"
+    )
+
+    bpy.types.Scene.tcp_scrub = FloatProperty(
+        name="TCP Scrub",
+        min=0.0, max=1.0, default=1.0, subtype='FACTOR',
+        description="Show first X% of TCP points and link segments",
+        update=_on_tcp_scrub_update
+    )
+
+
+
 
 def unregister():
     del bpy.types.Scene.sa_base_name
@@ -596,6 +890,12 @@ def unregister():
     del bpy.types.Scene.tcp_step
     del bpy.types.Scene.tcp_column_major
     del bpy.types.Scene.tcp_material
+    del bpy.types.Scene.tcp_link_material
+
+    del bpy.types.Scene.tcp_link_extend
+    del bpy.types.Scene.tcp_end_material
+
+    del bpy.types.Scene.tcp_scrub
 
 
     for cls in reversed(classes):
