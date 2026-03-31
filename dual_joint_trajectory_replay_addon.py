@@ -10,7 +10,9 @@ bl_info = {
 # from matplotlib.style import context
 import bpy, os, math, bisect
 from bpy.types import Panel, Operator
-from bpy.props import StringProperty, BoolProperty, IntProperty, FloatProperty, EnumProperty
+from bpy.props import StringProperty, BoolProperty, IntProperty, FloatProperty, EnumProperty, PointerProperty
+from bpy.app.handlers import persistent
+from types import SimpleNamespace
 from mathutils import Vector
 import bmesh
 
@@ -18,6 +20,22 @@ import bmesh
 TRAJ_A = None     # {'t': [...], 'q': [[7],...]} for Arm A
 TRAJ_B = None     # same for Arm B
 ARMREFS = {'A': None, 'B': None}   # caches (obj,bone) lists per arm
+_SCRUB_SYNC_LOCK = False
+
+
+def _sync_tcp_scrub_with_sa(scene):
+    """Optionally keep tcp_scrub equal to sa_scrub, with recursion guard."""
+    global _SCRUB_SYNC_LOCK
+    if _SCRUB_SYNC_LOCK:
+        return
+    if not getattr(scene, "tcp_link_scrub_to_sa", False):
+        return
+    _SCRUB_SYNC_LOCK = True
+    try:
+        scene.tcp_scrub = scene.sa_scrub
+    finally:
+        _SCRUB_SYNC_LOCK = False
+
 
 # -------- Utilities --------
 # -------- TCP link (A<->B) utilities (ADD) --------
@@ -193,9 +211,26 @@ def apply_pose_from_scrub(context):
 
 def _on_scrub_update(self, context):
     try:
+        _sync_tcp_scrub_with_sa(context.scene)
         apply_pose_from_scrub(context)
+        if getattr(context.scene, "tcp_link_scrub_to_sa", False):
+            apply_tcp_scrub(context)
+            _apply_curve_hook_from_tcp(context)
     except Exception as e:
         print("[Dual] Scrub error:", e)
+
+
+@persistent
+def _on_frame_change_post(scene):
+    """Drive robot/TCP/curve from animated scrub values during playback/render."""
+    try:
+        _sync_tcp_scrub_with_sa(scene)
+        ctx = SimpleNamespace(scene=scene)
+        apply_pose_from_scrub(ctx)
+        apply_tcp_scrub(ctx)
+        _apply_curve_hook_from_tcp(ctx)
+    except Exception as e:
+        print("[Dual] Frame update error:", e)
 
 # -------- TCP utilities (ADD) --------
 def _ensure_collection(name):
@@ -273,6 +308,9 @@ def _scatter_tcp_points(points, radius=0.01, coll_name="TCP Points", material_na
     template_name = f"TCP_Marker_Template_{material_name}"
     template = _ensure_tcp_marker(template_name, material_name)
     coll = _ensure_collection(coll_name)
+    # Keep collection name stable but refresh contents to avoid stale stacked points.
+    for obj in list(coll.objects):
+        bpy.data.objects.remove(obj, do_unlink=True)
     # if material_name:
     #     _assign_material_to_template(template, material_name)  # <-- add this line
 
@@ -393,6 +431,212 @@ def _iter_collections_by_prefix(prefixes):
         if c.name.startswith(prefixes):
             yield c
 
+def _tcp_indexed_objects(coll, index_key="tcp_i"):
+    return [o for o in coll.objects if index_key in o]
+
+def _latest_tcp_point_in_collection(coll, factor, index_key="tcp_i"):
+    if not coll:
+        return None
+    indexed = _tcp_indexed_objects(coll, index_key=index_key)
+    if not indexed:
+        return None
+
+    max_i = max(int(o[index_key]) for o in indexed)
+    total = max_i + 1
+    if total <= 0:
+        return None
+
+    factor = max(0.0, min(1.0, float(factor)))
+    show_n = int(factor * total + 1e-9)
+    latest_i = 0 if show_n <= 0 else (show_n - 1)
+
+    idx_to_obj = {int(o[index_key]): o for o in indexed}
+    target = idx_to_obj.get(latest_i)
+    if target is None:
+        available = sorted(idx_to_obj.keys())
+        if not available:
+            return None
+        target = idx_to_obj[available[min(latest_i, len(available) - 1)]]
+
+    return target.matrix_world.translation.copy()
+
+def _latest_tcp_point_by_prefix(prefixes, factor, index_key="tcp_i"):
+    """Return world-space location of latest TCP point selected by scrub factor."""
+    best_obj = None
+    best_total = -1
+
+    for coll in _iter_collections_by_prefix(prefixes):
+        indexed = _tcp_indexed_objects(coll, index_key=index_key)
+        if not indexed:
+            continue
+
+        max_i = max(int(o[index_key]) for o in indexed)
+        total = max_i + 1
+        if total > best_total:
+            best_total = total
+            best_obj = indexed
+
+    if not best_obj or best_total <= 0:
+        return None
+
+    factor = max(0.0, min(1.0, float(factor)))
+    show_n = int(factor * best_total + 1e-9)
+    latest_i = 0 if show_n <= 0 else (show_n - 1)
+
+    idx_to_obj = {int(o[index_key]): o for o in best_obj}
+    target = idx_to_obj.get(latest_i)
+    if target is None:
+        # Sparse indices fallback
+        available = sorted(idx_to_obj.keys())
+        if not available:
+            return None
+        target = idx_to_obj[available[min(latest_i, len(available) - 1)]]
+
+    return target.matrix_world.translation.copy()
+
+def _poll_curve_object(self, obj):
+    return bool(obj) and obj.type == 'CURVE'
+
+
+def _clear_curve_shape_keys(curve_obj):
+    """Remove non-basis shape keys so live curve edits are not overridden."""
+    if not curve_obj or curve_obj.type != 'CURVE' or not curve_obj.data.shape_keys:
+        return 0
+    removed = 0
+    key_blocks = curve_obj.data.shape_keys.key_blocks
+    for kb in list(key_blocks)[1:][::-1]:
+        curve_obj.shape_key_remove(kb)
+        removed += 1
+    return removed
+
+def _apply_curve_hook_from_tcp(context):
+    scn = context.scene
+    if not getattr(scn, "tcp_drive_curve_enable", False):
+        return
+
+    curve_obj = getattr(scn, "tcp_curve_obj", None)
+    if not curve_obj or curve_obj.type != 'CURVE':
+        return
+
+    _clear_curve_shape_keys(curve_obj)
+
+    curve_data = curve_obj.data
+    if not curve_data or len(curve_data.splines) == 0:
+        return
+
+    spline_i = int(scn.tcp_curve_spline_index)
+    if spline_i < 0 or spline_i >= len(curve_data.splines):
+        print(f"[TCP] Curve hook: spline index {spline_i} out of range")
+        return
+
+    spline = curve_data.splines[spline_i]
+    if spline.type != 'BEZIER':
+        print("[TCP] Curve hook: selected spline is not BEZIER")
+        return
+
+    bezier_points = spline.bezier_points
+    if len(bezier_points) == 0:
+        return
+
+    pidx_a = int(scn.tcp_curve_point_a)
+    pidx_b = int(scn.tcp_curve_point_b)
+    if pidx_a < 0 or pidx_a >= len(bezier_points) or pidx_b < 0 or pidx_b >= len(bezier_points):
+        print("[TCP] Curve hook: control point index out of range")
+        return
+
+    # Prefer the collections created from the currently selected TCP filename.
+    fname = scn.da_tcp_filename or ""
+    coll_a = bpy.data.collections.get(f"TCP A ({fname})") if fname else None
+    coll_b = bpy.data.collections.get(f"TCP B ({fname})") if fname else None
+
+    pos_a = _latest_tcp_point_in_collection(coll_a, scn.tcp_scrub)
+    pos_b = _latest_tcp_point_in_collection(coll_b, scn.tcp_scrub)
+
+    # Fallback for legacy/mixed naming states.
+    if pos_a is None:
+        pos_a = _latest_tcp_point_by_prefix(("TCP A (",), scn.tcp_scrub)
+    if pos_b is None:
+        pos_b = _latest_tcp_point_by_prefix(("TCP B (",), scn.tcp_scrub)
+    if pos_a is None or pos_b is None:
+        return
+
+    # Bezier control points are stored in curve-local space.
+    inv_curve_mw = curve_obj.matrix_world.inverted_safe()
+    local_a = inv_curve_mw @ pos_a
+    local_b = inv_curve_mw @ pos_b
+    bezier_points[pidx_a].co = local_a
+    bezier_points[pidx_b].co = local_b
+
+    if getattr(scn, "tcp_curve_align_handles", False):
+        # Tangent in world -> mapped to local so handle length can be set in world units.
+        dir_w = pos_b - pos_a
+        if dir_w.length < 1e-9:
+            dir_w = Vector((1.0, 0.0, 0.0))
+        else:
+            dir_w.normalize()
+
+        dir_l = inv_curve_mw.to_3x3() @ dir_w
+        if dir_l.length < 1e-9:
+            dir_l = (local_b - local_a)
+        if dir_l.length < 1e-9:
+            dir_l = Vector((1.0, 0.0, 0.0))
+        else:
+            dir_l.normalize()
+
+        # Convert requested world-space handle length to local-space along tangent.
+        w_per_l = (curve_obj.matrix_world.to_3x3() @ dir_l).length
+        l_len = float(scn.tcp_curve_handle_length) / max(w_per_l, 1e-9)
+
+        def _neighbor_co(points, i_prev, i_next):
+            prev_co = points[i_prev].co.copy() if 0 <= i_prev < len(points) else None
+            next_co = points[i_next].co.copy() if 0 <= i_next < len(points) else None
+            return prev_co, next_co
+
+        def _assign_handles_with_best_orientation(p, prev_co, next_co):
+            # Candidate 1: left=-dir, right=+dir
+            l1 = p.co - dir_l * l_len
+            r1 = p.co + dir_l * l_len
+            # Candidate 2: swapped
+            l2 = p.co + dir_l * l_len
+            r2 = p.co - dir_l * l_len
+
+            # Prefer left handle toward previous point and right handle toward next point.
+            s1 = 0.0
+            s2 = 0.0
+            if prev_co is not None:
+                s1 += (l1 - prev_co).length
+                s2 += (l2 - prev_co).length
+            if next_co is not None:
+                s1 += (r1 - next_co).length
+                s2 += (r2 - next_co).length
+
+            p.handle_left_type = 'FREE'
+            p.handle_right_type = 'FREE'
+            if s2 < s1:
+                p.handle_left = l2
+                p.handle_right = r2
+            else:
+                p.handle_left = l1
+                p.handle_right = r1
+
+        pa = bezier_points[pidx_a]
+        pb = bezier_points[pidx_b]
+        prev_a, next_a = _neighbor_co(bezier_points, pidx_a - 1, pidx_a + 1)
+        prev_b, next_b = _neighbor_co(bezier_points, pidx_b - 1, pidx_b + 1)
+        _assign_handles_with_best_orientation(pa, prev_a, next_a)
+        _assign_handles_with_best_orientation(pb, prev_b, next_b)
+    try:
+        curve_data.update()
+    except Exception:
+        try:
+            curve_data.update_tag()
+        except Exception:
+            pass
+    try:
+        context.view_layer.update()
+    except Exception:
+        pass
+
 def _apply_scrub_to_collection_objects(coll, factor, index_key="tcp_i"):
     """Hide objects whose custom index >= show_n."""
     indexed = [o for o in coll.objects if index_key in o]
@@ -426,6 +670,7 @@ def apply_tcp_scrub(context):
 def _on_tcp_scrub_update(self, context):
     try:
         apply_tcp_scrub(context)
+        _apply_curve_hook_from_tcp(context)
     except Exception as e:
         print("[TCP] Scrub error:", e)
 
@@ -435,6 +680,9 @@ def _make_tcp_link_segment_objects(points_a, points_b,
                                   material_name="trajectoryGray",
                                   radius=0.002):
     coll = _ensure_collection(coll_name)
+    # Refresh link collection to avoid stale stacked segments from previous runs.
+    for obj in list(coll.objects):
+        bpy.data.objects.remove(obj, do_unlink=True)
 
     n = min(len(points_a), len(points_b))
     if n == 0:
@@ -550,6 +798,8 @@ class SA_OT_tcp_visualize_a(Operator):
             n = _scatter_tcp_points(pts, radius=scn.tcp_radius, coll_name=f"TCP A ({fname})", material_name=scn.tcp_material)
         except Exception as e:
             self.report({'ERROR'}, f"TCP A: {e}"); return {'CANCELLED'}
+        apply_tcp_scrub(context)
+        _apply_curve_hook_from_tcp(context)
         self.report({'INFO'}, f"TCP A: Plotted {n} points")
         return {'FINISHED'}
 
@@ -577,6 +827,8 @@ class SA_OT_tcp_visualize_b(Operator):
             n = _scatter_tcp_points(pts, radius=scn.tcp_radius, coll_name=f"TCP B ({fname})", material_name=scn.tcp_material)
         except Exception as e:
             self.report({'ERROR'}, f"TCP B: {e}"); return {'CANCELLED'}
+        apply_tcp_scrub(context)
+        _apply_curve_hook_from_tcp(context)
         self.report({'INFO'}, f"TCP B: Plotted {n} points")
         return {'FINISHED'}
     
@@ -675,7 +927,7 @@ class SA_OT_tcp_visualize_ab_links(Operator):
             )
 
             apply_tcp_scrub(context)
-            apply_tcp_scrub(context)
+            _apply_curve_hook_from_tcp(context)
 
         except Exception as e:
             self.report({'ERROR'}, f"TCP Links: {e}")
@@ -692,7 +944,6 @@ class SA_OT_tcp_clear_links(Operator):
         n = _clear_tcp_links()
         self.report({'INFO'}, f"TCP Links: cleared {n} collection(s)")
         return {'FINISHED'}
-
 
 
 # -------- Panel --------
@@ -753,6 +1004,7 @@ class VIEW3D_PT_dual_arm_traj(Panel):
         box = layout.box()
         box.label(text="Scrub", icon='PLAY')
         box.prop(scn, "sa_scrub", text="Scrub (0–100%)")
+        box.prop(scn, "tcp_link_scrub_to_sa", text="Link TCP Scrub To Scrub")
         row = box.row(align=True)
         row.label(text=f"Time: {scn.sa_time:.3f} s")
         if not TRAJ_A and not TRAJ_B:
@@ -790,6 +1042,18 @@ class VIEW3D_PT_dual_arm_traj(Panel):
         box.label(text="TCP Scrub", icon='DRIVER')
         box.prop(scn, "tcp_scrub", text="Show (0–100%)")
 
+        box.separator()
+        box.label(text="Bezier Hook", icon='CURVE_BEZCURVE')
+        box.prop(scn, "tcp_drive_curve_enable", text="Enable Curve Hook")
+        box.prop(scn, "tcp_curve_obj", text="Curve Object")
+        row = box.row(align=True)
+        row.prop(scn, "tcp_curve_spline_index", text="Spline")
+        row.prop(scn, "tcp_curve_point_a", text="Point A")
+        row.prop(scn, "tcp_curve_point_b", text="Point B")
+        box.prop(scn, "tcp_curve_align_handles", text="Align Handles To Tangent")
+        if scn.tcp_curve_align_handles:
+            box.prop(scn, "tcp_curve_handle_length", text="Handle Length (world)")
+
 
 # -------- Register --------
 classes = (
@@ -804,6 +1068,8 @@ classes = (
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+    if _on_frame_change_post not in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.append(_on_frame_change_post)
     # Mapping
     bpy.types.Scene.sa_base_name   = StringProperty(name="Base",  default="fer_link")
     bpy.types.Scene.sa_bone_name   = StringProperty(name="Bone",  default="Bone")
@@ -837,6 +1103,11 @@ def register():
         update=_on_scrub_update
     )
     bpy.types.Scene.sa_time  = FloatProperty(name="Time (s)", default=0.0, precision=4)
+    bpy.types.Scene.tcp_link_scrub_to_sa = BoolProperty(
+        name="Link TCP Scrub To Scrub",
+        default=True,
+        description="When enabled, TCP scrub follows the main scrub value"
+    )
 
     # TCP shared options (ADD)
     bpy.types.Scene.da_tcp_filename   = StringProperty(name="TCP filename", default="tcp.txt")
@@ -862,10 +1133,39 @@ def register():
         update=_on_tcp_scrub_update
     )
 
+    bpy.types.Scene.tcp_drive_curve_enable = BoolProperty(
+        name="Drive Bezier from TCP",
+        default=False,
+        description="Move two Bezier control points using latest visible TCP A/B points"
+    )
+    bpy.types.Scene.tcp_curve_obj = PointerProperty(
+        name="Curve Object",
+        type=bpy.types.Object,
+        poll=_poll_curve_object
+    )
+    bpy.types.Scene.tcp_curve_spline_index = IntProperty(name="Curve spline index", default=0, min=0)
+    bpy.types.Scene.tcp_curve_point_a = IntProperty(name="Curve point A", default=0, min=0)
+    bpy.types.Scene.tcp_curve_point_b = IntProperty(name="Curve point B", default=1, min=0)
+    bpy.types.Scene.tcp_curve_align_handles = BoolProperty(
+        name="Align Curve Handles",
+        default=False,
+        description="Align both handles around each driven control point to the A-B tangent"
+    )
+    bpy.types.Scene.tcp_curve_handle_length = FloatProperty(
+        name="Curve handle length",
+        default=0.06,
+        min=0.0,
+        soft_max=0.5,
+        description="Bezier handle length in world units"
+    )
+
 
 
 
 def unregister():
+    if _on_frame_change_post in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.remove(_on_frame_change_post)
+
     del bpy.types.Scene.sa_base_name
     del bpy.types.Scene.sa_bone_name
     del bpy.types.Scene.sa_start_index
@@ -884,6 +1184,7 @@ def unregister():
 
     del bpy.types.Scene.sa_scrub
     del bpy.types.Scene.sa_time
+    del bpy.types.Scene.tcp_link_scrub_to_sa
 
     del bpy.types.Scene.da_tcp_filename
     del bpy.types.Scene.tcp_radius
@@ -896,6 +1197,14 @@ def unregister():
     del bpy.types.Scene.tcp_end_material
 
     del bpy.types.Scene.tcp_scrub
+
+    del bpy.types.Scene.tcp_drive_curve_enable
+    del bpy.types.Scene.tcp_curve_obj
+    del bpy.types.Scene.tcp_curve_spline_index
+    del bpy.types.Scene.tcp_curve_point_a
+    del bpy.types.Scene.tcp_curve_point_b
+    del bpy.types.Scene.tcp_curve_align_handles
+    del bpy.types.Scene.tcp_curve_handle_length
 
 
     for cls in reversed(classes):
