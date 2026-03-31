@@ -37,6 +37,23 @@ def _sync_tcp_scrub_with_sa(scene):
         _SCRUB_SYNC_LOCK = False
 
 
+def _effective_tcp_scrub(scene):
+    """Use main scrub when linked, otherwise use dedicated TCP scrub."""
+    if getattr(scene, "tcp_link_scrub_to_sa", False):
+        return float(scene.sa_scrub)
+    return float(scene.tcp_scrub)
+
+
+def _is_rendering_job():
+    fn = getattr(bpy.app, "is_job_running", None)
+    if not callable(fn):
+        return False
+    try:
+        return bool(fn("RENDER"))
+    except Exception:
+        return False
+
+
 # -------- Utilities --------
 # -------- TCP link (A<->B) utilities (ADD) --------
 def _ensure_material(mat_name):
@@ -221,13 +238,14 @@ def _on_scrub_update(self, context):
 
 
 @persistent
-def _on_frame_change_post(scene):
+def _on_frame_change_pre(scene):
     """Drive robot/TCP/curve from animated scrub values during playback/render."""
     try:
-        _sync_tcp_scrub_with_sa(scene)
         ctx = SimpleNamespace(scene=scene)
         apply_pose_from_scrub(ctx)
-        apply_tcp_scrub(ctx)
+        # During render, avoid thousands of per-object visibility writes each frame.
+        if not _is_rendering_job():
+            apply_tcp_scrub(ctx)
         _apply_curve_hook_from_tcp(ctx)
     except Exception as e:
         print("[Dual] Frame update error:", e)
@@ -434,6 +452,14 @@ def _iter_collections_by_prefix(prefixes):
 def _tcp_indexed_objects(coll, index_key="tcp_i"):
     return [o for o in coll.objects if index_key in o]
 
+
+def _latest_tcp_index(total, factor):
+    """Map scrub factor [0,1] to latest sample index [0,total-1] without lag."""
+    if total <= 0:
+        return 0
+    factor = max(0.0, min(1.0, float(factor)))
+    return min(int(factor * total + 1e-9), total - 1)
+
 def _latest_tcp_point_in_collection(coll, factor, index_key="tcp_i"):
     if not coll:
         return None
@@ -446,9 +472,7 @@ def _latest_tcp_point_in_collection(coll, factor, index_key="tcp_i"):
     if total <= 0:
         return None
 
-    factor = max(0.0, min(1.0, float(factor)))
-    show_n = int(factor * total + 1e-9)
-    latest_i = 0 if show_n <= 0 else (show_n - 1)
+    latest_i = _latest_tcp_index(total, factor)
 
     idx_to_obj = {int(o[index_key]): o for o in indexed}
     target = idx_to_obj.get(latest_i)
@@ -479,9 +503,7 @@ def _latest_tcp_point_by_prefix(prefixes, factor, index_key="tcp_i"):
     if not best_obj or best_total <= 0:
         return None
 
-    factor = max(0.0, min(1.0, float(factor)))
-    show_n = int(factor * best_total + 1e-9)
-    latest_i = 0 if show_n <= 0 else (show_n - 1)
+    latest_i = _latest_tcp_index(best_total, factor)
 
     idx_to_obj = {int(o[index_key]): o for o in best_obj}
     target = idx_to_obj.get(latest_i)
@@ -518,8 +540,6 @@ def _apply_curve_hook_from_tcp(context):
     if not curve_obj or curve_obj.type != 'CURVE':
         return
 
-    _clear_curve_shape_keys(curve_obj)
-
     curve_data = curve_obj.data
     if not curve_data or len(curve_data.splines) == 0:
         return
@@ -549,14 +569,15 @@ def _apply_curve_hook_from_tcp(context):
     coll_a = bpy.data.collections.get(f"TCP A ({fname})") if fname else None
     coll_b = bpy.data.collections.get(f"TCP B ({fname})") if fname else None
 
-    pos_a = _latest_tcp_point_in_collection(coll_a, scn.tcp_scrub)
-    pos_b = _latest_tcp_point_in_collection(coll_b, scn.tcp_scrub)
+    tcp_factor = _effective_tcp_scrub(scn)
+    pos_a = _latest_tcp_point_in_collection(coll_a, tcp_factor)
+    pos_b = _latest_tcp_point_in_collection(coll_b, tcp_factor)
 
     # Fallback for legacy/mixed naming states.
     if pos_a is None:
-        pos_a = _latest_tcp_point_by_prefix(("TCP A (",), scn.tcp_scrub)
+        pos_a = _latest_tcp_point_by_prefix(("TCP A (",), tcp_factor)
     if pos_b is None:
-        pos_b = _latest_tcp_point_by_prefix(("TCP B (",), scn.tcp_scrub)
+        pos_b = _latest_tcp_point_by_prefix(("TCP B (",), tcp_factor)
     if pos_a is None or pos_b is None:
         return
 
@@ -625,6 +646,9 @@ def _apply_curve_hook_from_tcp(context):
         prev_b, next_b = _neighbor_co(bezier_points, pidx_b - 1, pidx_b + 1)
         _assign_handles_with_best_orientation(pa, prev_a, next_a)
         _assign_handles_with_best_orientation(pb, prev_b, next_b)
+    # Let Blender's frame evaluation handle updates during render for stability.
+    if _is_rendering_job():
+        return
     try:
         curve_data.update()
     except Exception:
@@ -646,18 +670,18 @@ def _apply_scrub_to_collection_objects(coll, factor, index_key="tcp_i"):
     max_i = max(int(o[index_key]) for o in indexed)
     total = max_i + 1
 
-    factor = max(0.0, min(1.0, float(factor)))
-    show_n = int(factor * total + 1e-9)  # 0->none, 1->all
+    latest_i = _latest_tcp_index(total, factor)
 
     for o in indexed:
         i = int(o[index_key])
-        hide = (i >= show_n)
-        o.hide_set(hide)
+        hide = (i > latest_i)
+        if not _is_rendering_job():
+            o.hide_set(hide)
         o.hide_render = hide
 
 def apply_tcp_scrub(context):
     scn = context.scene
-    f = scn.tcp_scrub
+    f = _effective_tcp_scrub(scn)
 
     # Points collections (A, B, EXT endpoints)
     for coll in _iter_collections_by_prefix(("TCP A (", "TCP B (", "TCP Endpoints EXT (")):
@@ -1068,8 +1092,8 @@ classes = (
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-    if _on_frame_change_post not in bpy.app.handlers.frame_change_post:
-        bpy.app.handlers.frame_change_post.append(_on_frame_change_post)
+    if _on_frame_change_pre not in bpy.app.handlers.frame_change_pre:
+        bpy.app.handlers.frame_change_pre.append(_on_frame_change_pre)
     # Mapping
     bpy.types.Scene.sa_base_name   = StringProperty(name="Base",  default="fer_link")
     bpy.types.Scene.sa_bone_name   = StringProperty(name="Bone",  default="Bone")
@@ -1163,8 +1187,8 @@ def register():
 
 
 def unregister():
-    if _on_frame_change_post in bpy.app.handlers.frame_change_post:
-        bpy.app.handlers.frame_change_post.remove(_on_frame_change_post)
+    if _on_frame_change_pre in bpy.app.handlers.frame_change_pre:
+        bpy.app.handlers.frame_change_pre.remove(_on_frame_change_pre)
 
     del bpy.types.Scene.sa_base_name
     del bpy.types.Scene.sa_bone_name
