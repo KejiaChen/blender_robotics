@@ -1,62 +1,70 @@
 bl_info = {
-    "name": "Robot Left Live IK",
+    "name": "Robot Left Hybrid IK",
     "author": "OpenAI Codex",
-    "version": (0, 1, 0),
+    "version": (0, 3, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Robotics",
-    "description": "Drive robot_left Panda joints from a draggable TCP target",
+    "description": "Drive robot_left with a fast native Panda IK seed plus visible-chain correction",
     "category": "Rigging",
 }
 
 import math
+import pathlib
 import sys
 
 import bpy
 from bpy.app.handlers import persistent
 from bpy.props import BoolProperty
 from bpy.types import Operator, Panel
-from mathutils import Euler, Matrix, Vector
+from mathutils import Matrix, Vector
 
 
+BACKUP_BLEND = "/home/tp2/Documents/kejia/blender/dual_arm_cable_clip_backup.blend"
 TCP_NAME = "TCP_robot_left"
-HAND_NAME = "fer_hand.002"
-JOINT_OBJECTS = [f"fer_link{i}.002" for i in range(1, 8)]
+SOLVER_NAME = "Panda_left_solver"
+SOLVER_TCP_NAME = "TCP_left_solver"
+EE_OBJECT_NAME = "fer_link8.002"
 JOINT_BONE = "Bone"
+VISIBLE_JOINTS = [f"fer_link{i}.002" for i in range(1, 8)]
+SOLVER_BONES = [f"Axis-{i}" for i in range(1, 8)]
+
 _HANDLER_GUARD = False
 _LAST_TCP_STATE = None
-_CALIBRATION = None
-_CHAIN_CACHE = None
+_Q_OFFSETS = None
 
 
-def _joint_objects():
+def _visible_joint_objects():
     objs = []
-    for name in JOINT_OBJECTS:
+    for name in VISIBLE_JOINTS:
         obj = bpy.data.objects.get(name)
         if obj is None or obj.type != "ARMATURE":
             return None
         bone = obj.pose.bones.get(JOINT_BONE)
         if bone is None:
             return None
-        if bone.rotation_mode != "XYZ":
-            bone.rotation_mode = "XYZ"
+        bone.rotation_mode = "XYZ"
         objs.append(obj)
     return objs
 
 
-def _hand_object():
-    return bpy.data.objects.get(HAND_NAME)
-
-
-def _current_q():
-    objs = _joint_objects()
+def _visible_q():
+    objs = _visible_joint_objects()
     if not objs:
         return None
     return [obj.pose.bones[JOINT_BONE].rotation_euler.y for obj in objs]
 
 
-def _joint_limits():
+def _set_visible_q(q_values):
+    objs = _visible_joint_objects()
+    if not objs:
+        return
+    for obj, q_value in zip(objs, q_values):
+        obj.pose.bones[JOINT_BONE].rotation_euler.y = q_value
+
+
+def _visible_limits():
     limits = []
-    objs = _joint_objects()
+    objs = _visible_joint_objects()
     if not objs:
         return None
     for obj in objs:
@@ -64,9 +72,7 @@ def _joint_limits():
         lo = -math.pi
         hi = math.pi
         for constraint in bone.constraints:
-            if constraint.type != "LIMIT_ROTATION":
-                continue
-            if getattr(constraint, "use_limit_y", False):
+            if constraint.type == "LIMIT_ROTATION" and getattr(constraint, "use_limit_y", False):
                 lo = constraint.min_y
                 hi = constraint.max_y
                 break
@@ -74,20 +80,8 @@ def _joint_limits():
     return limits
 
 
-def _set_q(q_values):
-    objs = _joint_objects()
-    if not objs:
-        return
-    for obj, q in zip(objs, q_values):
-        obj.pose.bones[JOINT_BONE].rotation_euler.y = q
-
-
-def _rot_y(q_value):
-    return Euler((0.0, q_value, 0.0), "XYZ").to_matrix().to_4x4()
-
-
-def _frame_world(obj_name):
-    obj = bpy.data.objects.get(obj_name)
+def _visible_ee_matrix():
+    obj = bpy.data.objects.get(EE_OBJECT_NAME)
     if obj is None or obj.type != "ARMATURE":
         return None
     bone = obj.pose.bones.get(JOINT_BONE)
@@ -96,92 +90,49 @@ def _frame_world(obj_name):
     return obj.matrix_world.copy() @ bone.matrix.copy()
 
 
-def _extract_chain():
-    global _CHAIN_CACHE
-    if _CHAIN_CACHE is not None:
-        return _CHAIN_CACHE
-    q_values = _current_q()
-    hand = _hand_object()
-    if q_values is None or hand is None:
+def _predicted_visible_ee_matrix(q_values):
+    current_q = _visible_q()
+    if current_q is None:
         return None
-    base = _frame_world("fer_link0.002")
-    frames = [_frame_world(f"fer_link{i}.002") for i in range(1, 8)]
-    if base is None or any(frame is None for frame in frames):
+    try:
+        _set_visible_q(q_values)
+        bpy.context.view_layer.update()
+        ee = _visible_ee_matrix()
+        return ee.copy() if ee is not None else None
+    finally:
+        _set_visible_q(current_q)
+        bpy.context.view_layer.update()
+
+
+def _predicted_visible_pos(q_values):
+    ee = _predicted_visible_ee_matrix(q_values)
+    return None if ee is None else ee.translation.copy()
+
+
+def _jacobian_pos(q_values, eps=1e-4):
+    base = _predicted_visible_pos(q_values)
+    if base is None:
         return None
-    parent = base
-    fixed = []
-    for frame, q_value in zip(frames, q_values):
-        fixed.append(parent.inverted() @ frame @ _rot_y(-q_value))
-        parent = frame
-    hand_offset = frames[-1].inverted() @ hand.matrix_world.copy()
-    _CHAIN_CACHE = {
-        "base": base,
-        "fixed": fixed,
-        "hand_offset": hand_offset,
-    }
-    return _CHAIN_CACHE
-
-
-def _calibration():
-    global _CALIBRATION
-    if _CALIBRATION is not None:
-        return _CALIBRATION
-    chain = _extract_chain()
-    if chain is None:
-        return None
-    _CALIBRATION = Matrix.Identity(4)
-    return _CALIBRATION
-
-
-def _predicted_hand_matrix(q_values):
-    calibration = _calibration()
-    chain = _extract_chain()
-    if calibration is None or chain is None:
-        return None
-    transform = chain["base"].copy()
-    for fixed, q_value in zip(chain["fixed"], q_values):
-        transform @= fixed @ _rot_y(q_value)
-    transform @= chain["hand_offset"]
-    return calibration @ transform
-
-
-def _hand_pos(q_values):
-    matrix = _predicted_hand_matrix(q_values)
-    if matrix is None:
-        return None
-    return matrix.translation
-
-
-def _pos_error(q_values, target_pos):
-    hand_pos = _hand_pos(q_values)
-    if hand_pos is None:
-        return None
-    return target_pos - hand_pos
-
-
-def _jacobian(q_values, target_pos, eps=1e-4):
-    base_pos = _hand_pos(q_values)
-    if base_pos is None:
-        return None
-    columns = []
+    cols = []
     for i in range(len(q_values)):
         perturbed = list(q_values)
         perturbed[i] += eps
-        delta_pos = _hand_pos(perturbed)
-        columns.append((delta_pos - base_pos) / eps)
-    return columns
+        pos = _predicted_visible_pos(perturbed)
+        cols.append((pos - base) / eps)
+    return cols
 
 
-def _solve_to_target(target_pos, q_start, limits, iterations=48):
+def _solve_position_target(target_pos, q_start, limits, iterations=8):
     q_values = list(q_start)
-    damping = 0.03
+    damping = 0.035
     for _ in range(iterations):
-        error = _pos_error(q_values, target_pos)
-        if error is None:
+        pos = _predicted_visible_pos(q_values)
+        if pos is None:
             break
+        error = target_pos - pos
         if error.length < 1e-4:
             break
-        jac = _jacobian(q_values, target_pos)
+        jac = _jacobian_pos(q_values)
         if jac is None:
             break
         jjt = Matrix(((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)))
@@ -230,24 +181,112 @@ def ensure_tcp():
     return tcp
 
 
+def _solver_objects():
+    return bpy.data.objects.get(SOLVER_NAME), bpy.data.objects.get(SOLVER_TCP_NAME)
+
+
+def _hide_legacy_helpers():
+    for name in ["robot_left_IK_CTRL"]:
+        obj = bpy.data.objects.get(name)
+        if obj is not None:
+            obj.hide_viewport = True
+            obj.hide_render = True
+            obj.hide_set(True)
+
+
+def ensure_solver_pair():
+    solver, solver_tcp = _solver_objects()
+    if solver is None or solver_tcp is None:
+        with bpy.data.libraries.load(BACKUP_BLEND, link=False) as (data_from, data_to):
+            data_to.objects = ["Panda", "TCP"]
+        imported = [obj for obj in data_to.objects if obj is not None]
+        if len(imported) != 2:
+            return None, None
+        for obj in imported:
+            bpy.context.scene.collection.objects.link(obj)
+        solver = next(obj for obj in imported if obj.type == "ARMATURE")
+        solver_tcp = next(obj for obj in imported if obj.type == "EMPTY")
+        solver.name = SOLVER_NAME
+        solver_tcp.name = SOLVER_TCP_NAME
+        if solver.data is not None:
+            solver.data.name = f"{SOLVER_NAME}_data"
+    solver.hide_viewport = True
+    solver.hide_render = True
+    solver.hide_set(True)
+    solver_tcp.hide_viewport = True
+    solver_tcp.hide_render = True
+    solver_tcp.hide_set(True)
+    solver_tcp.empty_display_type = "ARROWS"
+    solver_tcp.empty_display_size = 0.12
+    solver_tcp.show_name = False
+    limits = _visible_limits() or []
+    for bone_name, limit_pair in zip(SOLVER_BONES, limits):
+        bone = solver.pose.bones[bone_name]
+        bone.rotation_mode = "XYZ"
+        bone.lock_ik_x = True
+        bone.lock_ik_z = True
+        bone.ik_stretch = 0.0
+        bone.use_ik_limit_y = True
+        bone.ik_min_y = limit_pair[0]
+        bone.ik_max_y = limit_pair[1]
+    ik = solver.pose.bones["Axis-7"].constraints.get("IK")
+    if ik is not None:
+        ik.target = solver_tcp
+        ik.use_tail = True
+        ik.mute = False
+    _hide_legacy_helpers()
+    return solver, solver_tcp
+
+
+def _extract_solver_q():
+    solver, _ = _solver_objects()
+    if solver is None:
+        return None
+    q_values = []
+    for bone_name in SOLVER_BONES:
+        pb = solver.pose.bones[bone_name]
+        if pb.parent:
+            rel = pb.parent.matrix.inverted() @ pb.matrix
+            rest = pb.parent.bone.matrix_local.inverted() @ pb.bone.matrix_local
+        else:
+            rel = pb.matrix.copy()
+            rest = pb.bone.matrix_local.copy()
+        delta = rest.inverted() @ rel
+        q_values.append(delta.to_euler("XYZ").y)
+    return q_values
+
+
+def _align_solver_pair_to_visible():
+    global _Q_OFFSETS
+    solver, solver_tcp = ensure_solver_pair()
+    visible_q = _visible_q()
+    ee = _visible_ee_matrix()
+    if solver is None or solver_tcp is None or visible_q is None or ee is None:
+        return None
+    transform = ee @ solver_tcp.matrix_world.inverted()
+    solver.matrix_world = transform @ solver.matrix_world
+    solver_tcp.matrix_world = transform @ solver_tcp.matrix_world
+    bpy.context.view_layer.update()
+    solver_q = _extract_solver_q()
+    if solver_q is None:
+        return None
+    _Q_OFFSETS = [vq - sq for vq, sq in zip(visible_q, solver_q)]
+    return solver, solver_tcp
+
+
 def sync_tcp_to_hand():
     global _LAST_TCP_STATE
-    hand = _hand_object()
     tcp = ensure_tcp()
-    if hand is None or tcp is None:
+    aligned = _align_solver_pair_to_visible()
+    ee = _visible_ee_matrix()
+    if aligned is None or ee is None:
         return None
-    tcp.matrix_world = hand.matrix_world.copy()
-    tcp.hide_viewport = False
-    tcp.hide_render = False
-    tcp.hide_set(False)
+    solver, solver_tcp = aligned
+    tcp.matrix_world = ee.copy()
+    solver_tcp.matrix_world = tcp.matrix_world.copy()
+    bpy.context.view_layer.update()
     _LAST_TCP_STATE = _tcp_state(tcp)
     return tcp
-
-
-def reset_calibration():
-    global _CALIBRATION, _CHAIN_CACHE
-    _CALIBRATION = None
-    _CHAIN_CACHE = None
 
 
 def solve_once():
@@ -257,20 +296,24 @@ def solve_once():
     scene = bpy.context.scene
     if not getattr(scene, "robot_left_live_ik_enabled", False):
         return False
-    tcp = bpy.data.objects.get(TCP_NAME)
-    if tcp is None:
+    tcp = ensure_tcp()
+    solver, solver_tcp = ensure_solver_pair()
+    if solver is None or solver_tcp is None or _Q_OFFSETS is None:
         return False
     state = _tcp_state(tcp)
     if state == _LAST_TCP_STATE:
         return False
-    q_start = _current_q()
-    limits = _joint_limits()
-    if q_start is None or limits is None:
-        return False
     _HANDLER_GUARD = True
     try:
-        solved = _solve_to_target(tcp.matrix_world.translation.copy(), q_start, limits)
-        _set_q(solved)
+        solver_tcp.matrix_world = tcp.matrix_world.copy()
+        bpy.context.view_layer.update()
+        solver_q = _extract_solver_q()
+        limits = _visible_limits()
+        if solver_q is None or limits is None:
+            return False
+        seed_q = [sq + off for sq, off in zip(solver_q, _Q_OFFSETS)]
+        solved_q = _solve_position_target(tcp.matrix_world.translation.copy(), seed_q, limits)
+        _set_visible_q(solved_q)
         bpy.context.view_layer.update()
         _LAST_TCP_STATE = state
     finally:
@@ -288,12 +331,14 @@ def robot_left_ik_handler(scene, depsgraph):
 class ROBOTLEFT_OT_enable_live_ik(Operator):
     bl_idname = "robot_left.enable_live_ik"
     bl_label = "Enable Left TCP IK"
-    bl_description = "Create the TCP target and enable live Panda IK for robot_left"
+    bl_description = "Enable fast hybrid IK for robot_left"
 
     def execute(self, context):
-        reset_calibration()
-        sync_tcp_to_hand()
         context.scene.robot_left_live_ik_enabled = True
+        tcp = sync_tcp_to_hand()
+        if tcp is None:
+            self.report({"ERROR"}, "Could not initialize left IK")
+            return {"CANCELLED"}
         solve_once()
         self.report({"INFO"}, "Left TCP IK enabled")
         return {"FINISHED"}
@@ -302,12 +347,14 @@ class ROBOTLEFT_OT_enable_live_ik(Operator):
 class ROBOTLEFT_OT_sync_tcp_to_hand(Operator):
     bl_idname = "robot_left.sync_tcp_to_hand"
     bl_label = "Snap TCP To Hand"
-    bl_description = "Recalibrate the TCP target to the current hand pose"
+    bl_description = "Snap the TCP control back onto the current robot flange"
 
     def execute(self, context):
-        reset_calibration()
-        sync_tcp_to_hand()
-        self.report({"INFO"}, "TCP snapped to the current hand pose")
+        tcp = sync_tcp_to_hand()
+        if tcp is None:
+            self.report({"ERROR"}, "Could not snap TCP")
+            return {"CANCELLED"}
+        self.report({"INFO"}, "TCP snapped to current flange pose")
         return {"FINISHED"}
 
 
@@ -323,8 +370,7 @@ class VIEW3D_PT_robot_left_live_ik(Panel):
         layout.prop(scene, "robot_left_live_ik_enabled", text="Enabled")
         layout.operator("robot_left.enable_live_ik")
         layout.operator("robot_left.sync_tcp_to_hand")
-        tcp = bpy.data.objects.get(TCP_NAME)
-        if tcp is not None:
+        if bpy.data.objects.get(TCP_NAME) is not None:
             layout.label(text=f"TCP: {TCP_NAME}")
 
 
@@ -350,10 +396,7 @@ def remove_handler():
 def ensure_setup():
     ensure_handler()
     ensure_tcp()
-    scene = bpy.context.scene
-    if getattr(scene, "robot_left_live_ik_enabled", False):
-        reset_calibration()
-        sync_tcp_to_hand()
+    _hide_legacy_helpers()
 
 
 def register():
@@ -361,8 +404,8 @@ def register():
         bpy.utils.register_class(cls)
     bpy.types.Scene.robot_left_live_ik_enabled = BoolProperty(
         name="Live IK",
-        default=True,
-        description="Keep robot_left joints synced to TCP_robot_left",
+        default=False,
+        description="Drive the visible left Panda from a fast hybrid IK rig",
     )
     ensure_setup()
 

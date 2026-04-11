@@ -1,0 +1,106 @@
+<?xml version="1.0"?>
+<robot name="panda_blender_left">
+  <!--
+    Blender-aligned Panda variant for the imported left arm in
+    dual_arm_cable_clip_evaluate_planning_IK.blend.
+
+    Purpose:
+    - preserve the imported fer_link*.002 chain ordering and fixed offsets
+    - preserve Panda joint limits
+    - expose a URDF model whose frames are much closer to the Blender robot
+
+    Notes:
+    - This file is for inspection/calibration first. It is not wired into the
+      active Pink solver yet.
+    - Link and joint names follow the Blender import rather than the original
+      panda_link* / panda_joint* naming.
+    - Revolute joint axes are set to local +Y to match the imported visible
+      arm, where each joint is currently driven through pose_bone.rotation_euler.y.
+  -->
+
+  <link name="robot_left_base"/>
+
+  <link name="fer_link0"/>
+  <joint name="robot_left_mount" type="fixed">
+    <parent link="robot_left_base"/>
+    <child link="fer_link0"/>
+    <origin xyz="0 -0.2809999883 0" rpy="1.57079632679 0 0.0001"/>
+  </joint>
+
+  <link name="fer_link1"/>
+  <joint name="fer_joint1" type="revolute">
+    <parent link="fer_link0"/>
+    <child link="fer_link1"/>
+    <origin xyz="0 0.3330000043 0" rpy="0.0000000755 0.0001000762 0"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="87" lower="-2.9671" upper="2.9671" velocity="2.3925"/>
+  </joint>
+
+  <link name="fer_link2"/>
+  <joint name="fer_joint2" type="revolute">
+    <parent link="fer_link1"/>
+    <child link="fer_link2"/>
+    <origin xyz="-0.0000000057 -0.0000000086 -0.0000000490" rpy="-1.5707964897 0.0001000023 -0.0000000298"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="87" lower="-1.8326" upper="1.8326" velocity="2.3925"/>
+  </joint>
+
+  <link name="fer_link3"/>
+  <joint name="fer_joint3" type="revolute">
+    <parent link="fer_link2"/>
+    <child link="fer_link3"/>
+    <origin xyz="0.0000001006 -0.0000000842 0.3160001040" rpy="1.5707962513 -0.0000000392 0.0000999272"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="87" lower="-2.9671" upper="2.9671" velocity="2.3925"/>
+  </joint>
+
+  <link name="fer_link4"/>
+  <joint name="fer_joint4" type="revolute">
+    <parent link="fer_link3"/>
+    <child link="fer_link4"/>
+    <origin xyz="0.0824999809 0.0000001863 0.0000248794" rpy="1.5707958937 0.0002000557 0.0000001788"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="87" lower="-3.1416" upper="0.0873" velocity="2.3925"/>
+  </joint>
+
+  <link name="fer_link5"/>
+  <joint name="fer_joint5" type="revolute">
+    <parent link="fer_link4"/>
+    <child link="fer_link5"/>
+    <origin xyz="-0.0825000107 -0.0000407957 -0.3839997649" rpy="-1.5707964897 0.0000001597 -0.0001000165"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="12" lower="-2.9671" upper="2.9671" velocity="2.8710"/>
+  </joint>
+
+  <link name="fer_link6"/>
+  <joint name="fer_joint6" type="revolute">
+    <parent link="fer_link5"/>
+    <child link="fer_link6"/>
+    <origin xyz="0.0000001267 -0.0000000149 -0.0000000969" rpy="1.5707962513 0.0001998070 -0.0000000596"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="12" lower="-0.0873" upper="3.8223" velocity="2.8710"/>
+  </joint>
+
+  <link name="fer_link7"/>
+  <joint name="fer_joint7" type="revolute">
+    <parent link="fer_link6"/>
+    <child link="fer_link7"/>
+    <origin xyz="0.0879999474 0.0000702403 -0.0000002533" rpy="1.5707962513 -0.0000000169 -0.0000998973"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="12" lower="-2.9671" upper="2.9671" velocity="2.8710"/>
+  </joint>
+
+  <link name="fer_link8"/>
+  <joint name="fer_joint8" type="fixed">
+    <parent link="fer_link7"/>
+    <child link="fer_link8"/>
+    <origin xyz="-0.0000002235 0.1069999039 0.0000002310" rpy="-0.0000002980 -0.0001000017 0.0000001844"/>
+  </joint>
+
+  <link name="fer_hand"/>
+  <joint name="fer_hand_joint" type="fixed">
+    <parent link="fer_link8"/>
+    <child link="fer_hand"/>
+    <origin xyz="0.0000000331 0.0000001341 -0.0000000689" rpy="-0.0000004057 -0.7853984237 0.0000000632"/>
+  </joint>
+</robot>
