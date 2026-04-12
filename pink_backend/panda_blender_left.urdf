@@ -103,4 +103,25 @@
     <child link="fer_hand"/>
     <origin xyz="0.0000000331 0.0000001341 -0.0000000689" rpy="-0.0000004057 -0.7853984237 0.0000000632"/>
   </joint>
+
+  <link name="fer_leftfinger"/>
+  <joint name="fer_finger_joint1" type="fixed">
+    <parent link="fer_hand"/>
+    <child link="fer_leftfinger"/>
+    <origin xyz="0 0 0.0584" rpy="0 0 0"/>
+  </joint>
+
+  <link name="fer_rightfinger"/>
+  <joint name="fer_finger_joint2" type="fixed">
+    <parent link="fer_hand"/>
+    <child link="fer_rightfinger"/>
+    <origin xyz="0 0 0.0584" rpy="0 0 0"/>
+  </joint>
+
+  <link name="tcp_fingertips"/>
+  <joint name="tcp_fingertips_joint" type="fixed">
+    <parent link="fer_hand"/>
+    <child link="tcp_fingertips"/>
+    <origin xyz="0 0 0.1034" rpy="0 0 0"/>
+  </joint>
 </robot>
