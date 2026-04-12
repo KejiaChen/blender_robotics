@@ -1,0 +1,88 @@
+<?xml version="1.0"?>
+<robot name="panda_blender_right">
+  <link name="robot_right_base"/>
+
+  <link name="fer_link0"/>
+  <joint name="robot_right_mount" type="fixed">
+    <parent link="robot_right_base"/>
+    <child link="fer_link0"/>
+    <origin xyz="0 0.2809999883 0" rpy="1.57079632679 0 0.0001"/>
+  </joint>
+
+  <link name="fer_link1"/>
+  <joint name="fer_joint1" type="revolute">
+    <parent link="fer_link0"/>
+    <child link="fer_link1"/>
+    <origin xyz="0 0.3330000043 0" rpy="-0.0000000437 0.0001000464 0"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="87" lower="-2.8973" upper="2.8973" velocity="2.3925"/>
+  </joint>
+
+  <link name="fer_link2"/>
+  <joint name="fer_joint2" type="revolute">
+    <parent link="fer_link1"/>
+    <child link="fer_link2"/>
+    <origin xyz="-0.0000000103 0.0000000123 0.0000000475" rpy="-1.5707966089 0.0001000176 -0.0000000894"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="87" lower="-1.7628" upper="1.7628" velocity="2.3925"/>
+  </joint>
+
+  <link name="fer_link3"/>
+  <joint name="fer_joint3" type="revolute">
+    <parent link="fer_link2"/>
+    <child link="fer_link3"/>
+    <origin xyz="-0.0000000484 -0.0000001256 0.3160001040" rpy="1.5707962513 -0.0000000062 0.0001000166"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="87" lower="-2.8973" upper="2.8973" velocity="2.3925"/>
+  </joint>
+
+  <link name="fer_link4"/>
+  <joint name="fer_joint4" type="revolute">
+    <parent link="fer_link3"/>
+    <child link="fer_link4"/>
+    <origin xyz="0.0824999362 0.0000000522 0.0000247955" rpy="1.5707956553 0.0001999590 0"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="87" lower="-3.0718" upper="-0.06981317" velocity="2.3925"/>
+  </joint>
+
+  <link name="fer_link5"/>
+  <joint name="fer_joint5" type="revolute">
+    <parent link="fer_link4"/>
+    <child link="fer_link5"/>
+    <origin xyz="-0.0824999809 -0.0000409782 -0.3840000331" rpy="-1.5707964897 0.0000000115 -0.0000998676"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="12" lower="-2.8973" upper="2.8973" velocity="2.8710"/>
+  </joint>
+
+  <link name="fer_link6"/>
+  <joint name="fer_joint6" type="revolute">
+    <parent link="fer_link5"/>
+    <child link="fer_link6"/>
+    <origin xyz="0.0000000615 -0.0000001062 0.0000000782" rpy="1.5707961321 0.0002000251 0"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="12" lower="-0.0175" upper="3.7525" velocity="2.8710"/>
+  </joint>
+
+  <link name="fer_link7"/>
+  <joint name="fer_joint7" type="revolute">
+    <parent link="fer_link6"/>
+    <child link="fer_link7"/>
+    <origin xyz="0.0880000293 0.0000703763 -0.0000000638" rpy="1.5707961321 -0.0000000058 -0.0001001060"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="12" lower="-2.8973" upper="2.8973" velocity="2.8710"/>
+  </joint>
+
+  <link name="fer_link8"/>
+  <joint name="fer_joint8" type="fixed">
+    <parent link="fer_link7"/>
+    <child link="fer_link8"/>
+    <origin xyz="0.0000000069 0.1070000231 0.0000000731" rpy="-0.0000001052 -0.0000999908 0.0000000135"/>
+  </joint>
+
+  <link name="fer_hand"/>
+  <joint name="fer_hand_joint" type="fixed">
+    <parent link="fer_link8"/>
+    <child link="fer_hand"/>
+    <origin xyz="-0.0021109185 0.0379412062 0.0000948205" rpy="-0.0000002226 -0.7853983045 -0.0000000843"/>
+  </joint>
+</robot>
