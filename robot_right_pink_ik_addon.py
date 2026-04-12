@@ -13,6 +13,7 @@ import subprocess
 import sys
 
 import bpy
+import mathutils
 from bpy.app.handlers import persistent
 from bpy.props import BoolProperty
 from bpy.types import Operator, Panel
@@ -20,9 +21,10 @@ from bpy.types import Operator, Panel
 
 TCP_NAME = "TCP_robot_right"
 TCP_MARKER_NAME = "TCP_robot_right_marker"
-EE_OBJECT_NAME = "fer_link8.001"
+EE_OBJECT_NAME = "fer_hand.001"
 JOINT_BONE = "Bone"
 VISIBLE_JOINTS = [f"fer_link{i}.001" for i in range(1, 8)]
+TCP_LOCAL_OFFSET = (0.0, 0.1034, 0.0)
 BACKEND_CMD = [
     "/home/tp2/anaconda3/envs/blender/bin/python",
     "/home/tp2/Documents/kejia/blender/scripts/pink_backend/pink_ik_server_right.py",
@@ -44,7 +46,10 @@ def _ee_matrix_world():
     bone = obj.pose.bones.get(JOINT_BONE)
     if bone is None:
         return None
-    return obj.matrix_world.copy() @ bone.matrix.copy()
+    matrix = obj.matrix_world.copy() @ bone.matrix.copy()
+    tip_matrix = matrix.copy()
+    tip_matrix.translation = matrix @ mathutils.Vector(TCP_LOCAL_OFFSET)
+    return tip_matrix
 
 
 def _visible_q():

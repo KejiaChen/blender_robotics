@@ -15,7 +15,7 @@ from pink.tasks import DampingTask, FrameTask, PostureTask
 
 ROOT = Path("/home/tp2/Documents/kejia/blender/scripts/pink_backend")
 URDF_PATH = ROOT / "panda_blender_right.urdf"
-FRAME_NAME = "fer_link8"
+FRAME_NAME = "tcp_fingertips"
 
 
 def build_robot():

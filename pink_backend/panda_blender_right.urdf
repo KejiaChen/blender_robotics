@@ -79,10 +79,38 @@
     <origin xyz="0.0000000069 0.1070000231 0.0000000731" rpy="-0.0000001052 -0.0000999908 0.0000000135"/>
   </joint>
 
+  <link name="fer_sensone"/>
+  <joint name="fer_sensone_joint" type="fixed">
+    <parent link="fer_link8"/>
+    <child link="fer_sensone"/>
+    <origin xyz="-0.0021109185 0.0379412062 0.0000948205" rpy="-0.6154799466 -0.5235987285 0.9553164954"/>
+  </joint>
+
   <link name="fer_hand"/>
   <joint name="fer_hand_joint" type="fixed">
-    <parent link="fer_link8"/>
+    <parent link="fer_sensone"/>
     <child link="fer_hand"/>
-    <origin xyz="-0.0021109185 0.0379412062 0.0000948205" rpy="-0.0000002226 -0.7853983045 -0.0000000843"/>
+    <origin xyz="0 0 0" rpy="0 0 -0.785398163397"/>
+  </joint>
+
+  <link name="fer_leftfinger"/>
+  <joint name="fer_finger_joint1" type="fixed">
+    <parent link="fer_hand"/>
+    <child link="fer_leftfinger"/>
+    <origin xyz="0 0.0584 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="fer_rightfinger"/>
+  <joint name="fer_finger_joint2" type="fixed">
+    <parent link="fer_hand"/>
+    <child link="fer_rightfinger"/>
+    <origin xyz="0 0.0584 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="tcp_fingertips"/>
+  <joint name="tcp_fingertips_joint" type="fixed">
+    <parent link="fer_hand"/>
+    <child link="tcp_fingertips"/>
+    <origin xyz="0 0.1034 0" rpy="0 0 0"/>
   </joint>
 </robot>
